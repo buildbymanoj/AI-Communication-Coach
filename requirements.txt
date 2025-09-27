@@ -1,0 +1,11 @@
+gradio
+deepface
+transformers
+torch
+moviepy
+librosa
+soundfile
+openai-whisper
+datasets
+plotly
+opencv-python
