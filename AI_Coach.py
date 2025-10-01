@@ -1,617 +1,656 @@
-# --- 1. SETUP AND INSTALLATIONS ---
-print("⏳ Installing dependencies... This is only needed once per session.")
-!pip install -q gradio deepface transformers torch moviepy librosa soundfile openai-whisper datasets plotly opencv-python
-print("✅ Dependencies installed.")
-
-
-# --- 2. IMPORTS AND MODEL LOADING ---
 import gradio as gr
+import numpy as np
+import re
+import time
 import cv2
 import os
-import re
-import json
-import torch
-import numpy as np
-import random  # NEW: For dynamic phrasing variation
-from deepface import DeepFace
-from collections import Counter
-from moviepy.editor import VideoFileClip
-import librosa
+import tempfile
 from transformers import pipeline
-import plotly.graph_objects as go
-from typing import Dict, Optional, Any
 import whisper
+import subprocess
+import matplotlib.pyplot as plt
+import base64
+from io import BytesIO
 
-print("🧠 Loading AI models into memory... (This may take 1-2 minutes)")
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+# Load pre-trained models
+sentiment_analyzer = pipeline("sentiment-analysis")
+whisper_model = whisper.load_model("base")  # Choose size: tiny, base, small
 
-# Load Whisper (base for speed; use 'small' if you have RAM and want better accuracy)
-whisper_model = whisper.load_model("base")
+# Define filler words to track
+FILLER_WORDS = ["um", "uh", "like", "you know", "actually", "basically", "literally", 
+                "sort of", "kind of", "so", "well", "just", "stuff", "things"]
 
-# Sentiment analysis
-sentiment_analyzer = pipeline(
-    "sentiment-analysis",
-    model="distilbert-base-uncased-finetuned-sst-2-english",
-    device=device,
-    truncation=True,
-    max_length=512
-)
+# Define emotions for tracking and visualization
+EMOTIONS = ["happy", "sad", "angry", "surprise", "neutral"]
 
-# Vocal emotion classifier
-vocal_emotion_classifier = pipeline(
-    "audio-classification",
-    model="superb/wav2vec2-base-superb-er",
-    device=device
-)
-
-print("✅ AI models loaded. Ready for analysis!")
-
-
-# --- 3. HELPER FUNCTIONS (The AI Brain) ---
-
-def analyze_visuals(video_path: str, sample_rate: int = 1) -> Optional[Dict]:
-    """
-    Analyzes facial expressions frame-by-frame (1 frame per second).
-    Returns emotion distribution and dominant emotion.
-    """
+# Extract audio from video
+def extract_audio(video_path):
+    audio_path = tempfile.mktemp(suffix='.mp3')
+    
     try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError("Could not open video file.")
+        # Use ffmpeg to extract audio from video
+        command = [
+            "ffmpeg", 
+            "-i", video_path, 
+            "-q:a", "0", 
+            "-map", "a", 
+            audio_path
+        ]
+        
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return audio_path
+    except Exception as e:
+        print(f"Error extracting audio: {e}")
+        return None
 
-        frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
-        if frame_rate == 0:
-            frame_rate = 30  # fallback
+# Simple emotion estimation using face features
+def estimate_emotion(face_img):
+    # This is a simplified placeholder for emotion detection
+    # In a real implementation, you would use a proper emotion classification model
+    
+    if face_img is None or face_img.size == 0:
+        return {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0, "surprise": 0.0}
+    
+    # Resize for consistent processing
+    face_img = cv2.resize(face_img, (48, 48))
+    
+    # We'll use simple heuristics based on pixel intensities and gradients
+    # Extract different facial regions
+    h, w = face_img.shape
+    
+    # Divide face into regions (approximate locations)
+    forehead = face_img[0:int(h*0.3), :]
+    eyes = face_img[int(h*0.2):int(h*0.5), :]
+    mouth = face_img[int(h*0.6):h, :]
+    
+    # Calculate features
+    avg_intensity = np.mean(face_img)
+    mouth_variance = np.var(mouth)
+    eye_variance = np.var(eyes)
+    
+    # Horizontal gradient in mouth area (for smile detection)
+    # High gradient can indicate a smile
+    mouth_gradient_x = cv2.Sobel(mouth, cv2.CV_64F, 1, 0, ksize=3)
+    mouth_gradient_y = cv2.Sobel(mouth, cv2.CV_64F, 0, 1, ksize=3)
+    mouth_gradient_mag = np.sqrt(mouth_gradient_x**2 + mouth_gradient_y**2)
+    mouth_gradient = np.mean(mouth_gradient_mag)
+    
+    # Eye region gradient (for surprise/anger detection)
+    eye_gradient_x = cv2.Sobel(eyes, cv2.CV_64F, 1, 0, ksize=3)
+    eye_gradient_y = cv2.Sobel(eyes, cv2.CV_64F, 0, 1, ksize=3)
+    eye_gradient_mag = np.sqrt(eye_gradient_x**2 + eye_gradient_y**2)
+    eye_gradient = np.mean(eye_gradient_mag)
+    
+    # Default to neutral
+    emotions = {
+        "happy": 0.0,
+        "sad": 0.0,
+        "angry": 0.0,
+        "surprise": 0.0,
+        "neutral": 0.6  # Start with neutral as base
+    }
+    
+    # Happy: Higher mouth gradient, higher mouth variance
+    if mouth_gradient > 10 and mouth_variance > 300:
+        emotions["happy"] = 0.7
+        emotions["neutral"] -= 0.3
+    
+    # Sad: Lower mouth region intensity relative to eyes
+    mouth_eye_ratio = np.mean(mouth) / np.mean(eyes) if np.mean(eyes) > 0 else 1
+    if mouth_eye_ratio < 0.8:
+        emotions["sad"] = 0.5
+        emotions["neutral"] -= 0.2
+    
+    # Angry: High eye gradient, low mouth variance
+    if eye_gradient > 15 and mouth_variance < 200:
+        emotions["angry"] = 0.6
+        emotions["neutral"] -= 0.2
+    
+    # Surprise: High eye variance, high overall variance
+    if eye_variance > 500 and np.var(face_img) > 800:
+        emotions["surprise"] = 0.6
+        emotions["neutral"] -= 0.2
+    
+    # Ensure no negative values
+    for emotion in emotions:
+        emotions[emotion] = max(0.0, emotions[emotion])
+    
+    # Normalize to sum to 1
+    total = sum(emotions.values())
+    if total > 0:
+        for emotion in emotions:
+            emotions[emotion] /= total
+    
+    return emotions
 
-        emotions_detected = []
-        frame_count = 0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# Face detection function using OpenCV
+def detect_faces(frame):
+    # Load pre-trained face detector
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
+    # Convert to grayscale for face detection
+    if len(frame.shape) == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame  # Already grayscale
+    
+    # Detect faces
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30)
+    )
+    
+    return faces, gray
 
-        print(f"📊 Analyzing {total_frames} frames at {frame_rate} FPS... sampling every {sample_rate} second(s).")
+# Create emotion radar chart
+def create_emotion_radar_chart(emotions):
+    # Data preparation
+    emotions_list = list(emotions.items())
+    emotions_list.sort(key=lambda x: x[1], reverse=True)  # Sort by value
+    labels = [emotion[0].capitalize() for emotion in emotions_list]
+    values = [emotion[1] for emotion in emotions_list]
+    
+    # Create figure and polar subplot
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, polar=True)
+    
+    # Number of variables
+    N = len(labels)
+    
+    # Compute angle for each axis
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]  # Close the loop
+    
+    # Add values (and close the loop)
+    values += values[:1]
+    
+    # Draw the chart
+    ax.plot(angles, values, 'o-', linewidth=2)
+    ax.fill(angles, values, alpha=0.25)
+    
+    # Fix axis to go in the right order and start at 12 o'clock
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    
+    # Draw axis lines for each angle and label
+    plt.xticks(angles[:-1], labels)
+    
+    # Set y limits
+    ax.set_ylim(0, 1)
+    
+    # Add title
+    plt.title('Emotion Distribution', size=15, color='navy', y=1.1)
+    
+    # Save to BytesIO and encode as base64
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    
+    # Encode the image to base64
+    data = base64.b64encode(buf.getvalue()).decode('utf-8')
+    
+    return f"data:image/png;base64,{data}"
 
+def analyze_video(video_file):
+    if video_file is None:
+        return "Please upload a video file for analysis.", "", None
+    
+    result_dict = {"audio_analysis": {}, "visual_analysis": {}}
+    start_time = time.time()
+    
+    # === EXTRACT AUDIO FROM VIDEO ===
+    audio_file = extract_audio(video_file)
+    if not audio_file:
+        return "Failed to extract audio from video. Please check the format and try again.", "", None
+    
+    # === AUDIO ANALYSIS ===
+    # Transcribe audio using Whisper
+    audio_result = whisper_model.transcribe(audio_file)
+    transcription = audio_result["text"]
+    
+    if not transcription.strip():
+        return "No speech detected in the video. Please try again with clear audio.", "", None
+    
+    # Perform sentiment analysis
+    sentiment_result = sentiment_analyzer(transcription)[0]
+    sentiment_label = sentiment_result['label']
+    sentiment_score = sentiment_result['score']
+    
+    # Count words and calculate speech metrics
+    words = transcription.split()
+    total_words = len(words)
+    
+    # Calculate speech duration in minutes from the audio file
+    try:
+        import librosa
+        audio_duration = librosa.get_duration(filename=audio_file)
+    except:
+        audio_duration = audio_result.get("duration", 0)
+    
+    duration_minutes = audio_duration / 60
+    
+    # Calculate words per minute (WPM)
+    wpm = int(total_words / duration_minutes) if duration_minutes > 0 else 0
+    
+    # Count filler words
+    filler_count = 0
+    filler_instances = []
+    
+    lower_transcription = transcription.lower()
+    for filler in FILLER_WORDS:
+        matches = re.finditer(r'\b' + re.escape(filler) + r'\b', lower_transcription)
+        for match in matches:
+            filler_count += 1
+            filler_instances.append(filler)
+    
+    filler_percentage = (filler_count / total_words) * 100 if total_words > 0 else 0
+    
+    # Store audio analysis results
+    result_dict["audio_analysis"] = {
+        "transcription": transcription,
+        "sentiment": sentiment_label,
+        "sentiment_score": sentiment_score,
+        "total_words": total_words,
+        "duration_minutes": duration_minutes,
+        "wpm": wpm,
+        "filler_count": filler_count,
+        "filler_percentage": filler_percentage,
+        "filler_instances": filler_instances
+    }
+    
+    # === VISUAL ANALYSIS ===
+    visual_analysis = {
+        "face_detections": 0, 
+        "frame_count": 0, 
+        "eye_contact": 0,
+        "emotions": {emotion: 0 for emotion in EMOTIONS}
+    }
+    sample_frames = []
+    emotion_frame_counts = {emotion: 0 for emotion in EMOTIONS}
+    
+    # Process video for face detection and emotion analysis
+    cap = cv2.VideoCapture(video_file)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps if fps > 0 else 0
+    
+    # Initialize counters
+    face_detected_frames = 0
+    center_face_frames = 0
+    face_sizes = []
+    all_emotions = {emotion: [] for emotion in EMOTIONS}
+    
+    # Sample frames (analyze every 15th frame to save processing time)
+    sample_rate = 15
+    frame_idx = 0
+    
+    # Create a temporary directory to store frames
+    with tempfile.TemporaryDirectory() as temp_dir:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
-            if frame_count % (frame_rate * sample_rate) == 0:
-                try:
-                    result = DeepFace.analyze(
-                        frame,
-                        actions=['emotion'],
-                        enforce_detection=False,
-                        detector_backend='opencv'  # More robust than dlib for video
-                    )
-                    if isinstance(result, list) and len(result) > 0 and result[0].get('dominant_emotion'):
-                        # NEW: Confidence check (skip if <40%)
-                        dominant_emotion = result[0]['dominant_emotion']
-                        if result[0]['emotion'][dominant_emotion] > 40:
-                            emotions_detected.append(dominant_emotion)
-                except Exception as e:
-                    # Skip frame if analysis fails (e.g., no face)
-                    pass
-
-            frame_count += 1
-            if frame_count % (frame_rate * 10) == 0:  # Progress every 10 seconds
-                print(f"   ... {frame_count // frame_rate}s processed")
-
+                
+            frame_idx += 1
+            if frame_idx % sample_rate != 0:  # Skip frames for efficiency
+                continue
+            
+            visual_analysis["frame_count"] += 1
+            
+            try:
+                # Detect faces
+                faces, gray = detect_faces(frame)
+                
+                if len(faces) > 0:
+                    face_detected_frames += 1
+                    
+                    # Get the largest face (presumably the speaker)
+                    largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
+                    x, y, w, h = largest_face
+                    
+                    # Save face size relative to frame
+                    face_size_percent = (w * h) / (frame.shape[1] * frame.shape[0]) * 100
+                    face_sizes.append(face_size_percent)
+                    
+                    # Extract face for emotion analysis
+                    face_roi = gray[y:y+h, x:x+w]
+                    
+                    # Analyze emotion with our simple classifier
+                    emotion_scores = estimate_emotion(face_roi)
+                    
+                    # Get dominant emotion
+                    dominant_emotion = max(emotion_scores.items(), key=lambda x: x[1])
+                    
+                    # Track emotions
+                    for emotion in EMOTIONS:
+                        score = emotion_scores.get(emotion, 0)
+                        all_emotions[emotion].append(score)
+                    
+                    # Count frames with this dominant emotion
+                    emotion_frame_counts[dominant_emotion[0]] += 1
+                    
+                    # Draw rectangle and emotion on frame
+                    frame_with_analysis = frame.copy()
+                    cv2.rectangle(frame_with_analysis, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    
+                    # Add emotion label
+                    emotion_text = f"{dominant_emotion[0]}: {dominant_emotion[1]:.0%}"
+                    cv2.putText(frame_with_analysis, emotion_text, 
+                               (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # Check if face is centered in frame (simple eye contact proxy)
+                    frame_center_x = frame.shape[1] / 2
+                    frame_center_y = frame.shape[0] / 2
+                    face_center_x = x + w/2
+                    face_center_y = y + h/2
+                    
+                    # If face is reasonably close to center, count as eye contact
+                    if (abs(face_center_x - frame_center_x) < frame.shape[1] * 0.2 and
+                        abs(face_center_y - frame_center_y) < frame.shape[0] * 0.2):
+                        center_face_frames += 1
+                    
+                    # Save sample frames with different dominant emotions
+                    # Try to get samples of different emotions
+                    if len(sample_frames) < 5:
+                        # Check if we already have a frame with this emotion
+                        emotion_exists = False
+                        for _, frame_emotion in sample_frames:
+                            if frame_emotion == dominant_emotion[0]:
+                                emotion_exists = True
+                                break
+                                
+                        # Save if new emotion or we need more samples
+                        if not emotion_exists or len(sample_frames) < 3:
+                            frame_path = os.path.join(temp_dir, f"{dominant_emotion[0]}_{len(sample_frames)}.jpg")
+                            cv2.imwrite(frame_path, frame_with_analysis)
+                            sample_frames.append((frame_path, dominant_emotion[0]))
+            
+            except Exception as e:
+                print(f"Error processing frame {frame_idx}: {e}")
+                continue
+        
         cap.release()
-
-        if not emotions_detected:
-            print("⚠️ No faces detected in video.")
-            return None
-
-        emotion_distribution = Counter(emotions_detected)
-        total = sum(emotion_distribution.values())
-        emotion_percentages = {k: v / total for k, v in emotion_distribution.items()}
-        dominant_emotion = max(emotion_percentages, key=emotion_percentages.get)
-
-        return {
-            "emotion_distribution": emotion_percentages,
-            "dominant_emotion": dominant_emotion,
-            "total_faces_detected": len(emotions_detected)
-        }
-
-    except Exception as e:
-        print(f"❌ Error in visual analysis: {e}")
-        return None
-
-
-def analyze_vocal_tone(audio_path: str) -> Optional[Dict]:
-    """Analyzes vocal emotion with confidence scoring."""
-    try:
-        predictions = vocal_emotion_classifier(audio_path, top_k=4)
-        emotion_mapping = {
-            'ang': 'Angry',
-            'hap': 'Happy',
-            'neu': 'Neutral',
-            'sad': 'Sad',
-            'sur': 'Surprised',
-            'dis': 'Disgusted',
-            'fea': 'Fearful'
-        }
-
-        top_pred = predictions[0]
-        dominant_vocal = emotion_mapping.get(top_pred['label'], top_pred['label'])
-        confidence = top_pred['score']
-
-        all_predictions = {
-            emotion_mapping.get(p['label'], p['label']): p['score']
-            for p in predictions
-        }
-
-        return {
-            "dominant_vocal_emotion": dominant_vocal,
-            "vocal_confidence": confidence,
-            "all_vocal_predictions": all_predictions
-        }
-    except Exception as e:
-        print(f"❌ Error in vocal tone analysis: {e}")
-        return None
-
-
-def analyze_audio_and_text(video_path: str) -> Dict[str, Any]:
-    """Extracts audio, transcribes, and analyzes speech patterns."""
-    audio_path = "temp_audio.wav"
-    analysis = {}
-
-    try:
-        # Extract audio with better quality
-        with VideoFileClip(video_path) as video:
-            video.audio.write_audiofile(
-                audio_path,
-                codec='pcm_s16le',
-                fps=16000,  # Whisper expects 16kHz
-                logger=None,
-                verbose=False
-            )
-
-        # Duration
-        duration = librosa.get_duration(path=audio_path)
-        analysis['duration'] = duration
-
-        # Transcription
-        result = whisper_model.transcribe(audio_path, fp16=False, language='en')
-        transcript = result['text'].strip()
-
-        if not transcript or len(transcript.strip()) < 5:
-            analysis['transcript'] = "No speech detected."
-        else:
-            analysis['transcript'] = transcript
-
-            # NEW: Extract filler examples for dynamic tips
-            FILLER_WORDS = re.compile(r'\b(um|uh|ah|like|so|you know|basically|actually|right|okay|well)\b', re.IGNORECASE)
-            words = transcript.split()
-            word_count = len(words)
-            wpm = (word_count / duration) * 60 if duration > 0 else 0
-            filler_matches = FILLER_WORDS.findall(transcript)
-            filler_count = len(filler_matches)
-            filler_rate = filler_count / word_count if word_count > 0 else 0
-            # NEW: Get specific filler examples (first 3)
-            filler_examples = list(set(filler_matches[:3]))  # Unique examples
-
-            # NEW: Transcript patterns (e.g., questions for engagement, repetition)
-            questions = len(re.findall(r'\?', transcript))
-            repetition_score = len(set(words)) / len(words) if words else 0  # Lower = more repetition
-
-            # Sentiment analysis (only if transcript is meaningful)
-            if word_count > 10:
-                sentiment = sentiment_analyzer(transcript)[0]
-                analysis['text_sentiment'] = sentiment['label']
-                analysis['text_sentiment_score'] = sentiment['score']
-            else:
-                analysis['text_sentiment'] = "N/A"
-                analysis['text_sentiment_score'] = 0.0
-
-            analysis['pace_wpm'] = wpm
-            analysis['filler_words'] = filler_count
-            analysis['filler_rate'] = filler_rate
-            analysis['filler_examples'] = filler_examples
-            analysis['word_count'] = word_count
-            analysis['questions_count'] = questions
-            analysis['repetition_score'] = repetition_score  # 1.0 = no repetition, <0.7 = repetitive
-
-    except Exception as e:
-        analysis['error'] = f"Audio/text processing failed: {e}"
-        print(f"❌ {analysis['error']}")
-
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-    return analysis
-
-
-# --- 4. NEW COACHING & VISUALIZATION FUNCTIONS ---
-
-def generate_coaching_tips(visual_data: Optional[Dict], audio_data: Dict) -> str:
-    """Generates personalized, empathetic, and ACTIONABLE coaching tips with dynamic variation."""
-    tips = []
-    score_components = {}
-
-    # Dynamic phrasing templates (NEW: For variety)
-    positive_phrases = ["Well done!", "You're nailing this!", "Excellent work!", "Great job!"]
-    suggestion_phrases = ["Here's a tip:", "Try this:", "Consider:", "To level up:"]
-    motivational_phrases = ["You've got this!", "Small tweaks make big differences!", "Keep practicing!"]
-
-    # --- CALCULATE ENGAGEMENT SCORE (NEW: Dynamic overall metric) ---
-    engagement_score = 5.0  # Start neutral
-    if 'pace_wpm' in audio_data:
-        wpm = audio_data['pace_wpm']
-        score_components['pace'] = max(0, min(10, 10 - abs(wpm - 145) / 10))  # Peak at 145 WPM
-        engagement_score += score_components['pace'] / 2
-    if 'filler_rate' in audio_data:
-        filler_rate = audio_data['filler_rate']
-        score_components['fillers'] = max(0, 10 - (filler_rate * 100 * 10))  # Penalize high rate
-        engagement_score += score_components['fillers'] / 2
-    if visual_data and 'emotion_distribution' in visual_data:
-        neutral_perc = visual_data['emotion_distribution'].get('neutral', 0)
-        score_components['expressiveness'] = max(0, 10 - (neutral_perc * 10))
-        engagement_score += score_components['expressiveness'] / 2
-    if 'text_sentiment_score' in audio_data:
-        engagement_score += audio_data['text_sentiment_score'] * 5  # Sentiment confidence boosts
-    engagement_score = max(0, min(10, engagement_score))  # Clamp 0-10
-    tips.append(f"📊 **Overall Engagement Score: {engagement_score:.1f}/10**  {random.choice(positive_phrases) if engagement_score > 7 else random.choice(motivational_phrases) if engagement_score > 4 else 'Room to grow—let\'s improve!'}")
-
-    # --- PACE (Enhanced with specifics) ---
-    if 'pace_wpm' in audio_data and audio_data.get('transcript') != "No speech detected.":
-        wpm = audio_data['pace_wpm']
-        word_count = audio_data.get('word_count', 0)
-        if wpm > 180:
-            tips.append(f"{random.choice(suggestion_phrases)} **Pacing:** At {wpm:.0f} WPM (very fast), your {word_count} words flew by! Practice the 'pause-and-breathe' technique: After every sentence, pause for 2 seconds. This boosts retention by 20%.")
-            engagement_score -= 1  # Adjust if needed
-        elif wpm > 170:
-            tips.append(f"{random.choice(suggestion_phrases)} **Pacing:** {wpm:.0f} WPM is energetic but rushed. Slow to 150-160 WPM for emphasis—try timing yourself with a 60-second mirror practice.")
-        elif 140 <= wpm <= 170:
-            tips.append(f"✅ **Pacing:** Ideal at {wpm:.0f} WPM! Your rhythm keeps listeners hooked. {random.choice(positive_phrases)}")
-        elif 120 <= wpm < 140:
-            tips.append(f"{random.choice(suggestion_phrases)} **Pacing:** {wpm:.0f} WPM is steady but could add energy. Vary your speed—speed up for excitement, slow for impact. Experiment in your next recording!")
-        else:  # <120
-            tips.append(f"{random.choice(suggestion_phrases)} **Pacing:** Slow at {wpm:.0f} WPM—great for detail, but inject pace to engage. Use a metronome app at 140 beats/min to build rhythm. {random.choice(motivational_phrases)}")
-
-    # --- FILLER WORDS (NEW: Transcript-specific examples) ---
-    if 'filler_words' in audio_data and audio_data.get('word_count', 0) > 10:
-        fillers = audio_data['filler_words']
-        filler_rate = audio_data['filler_rate']
-        examples = audio_data.get('filler_examples', [])
-        duration_min = audio_data['duration'] / 60
-        fillers_per_min = fillers / duration_min if duration_min > 0 else 0
-        if fillers_per_min > 6 or filler_rate > 0.1:
-            ex_str = f" (e.g., '{', '.join(examples)}')" if examples else ""
-            tips.append(f"{random.choice(suggestion_phrases)} **Clarity:** {fillers} fillers ({fillers_per_min:.1f}/min){ex_str}—common in natural speech! Replace with silence: Record a 'filler-free' version of your transcript. You'll sound more authoritative instantly.")
-        elif fillers_per_min > 3 or filler_rate > 0.05:
-            ex_str = f" (like '{', '.join(examples)}')" if examples else ""
-            tips.append(f"✅ **Clarity:** Moderate {fillers} fillers{ex_str}—you're improving! Pause instead next time. {random.choice(positive_phrases)} Progress!")
-        else:
-            tips.append(f"🌟 **Clarity:** Minimal {fillers} fillers—confident delivery! This polish sets you apart in presentations.")
-
-    # --- TRANSCRIPT PATTERNS (NEW: Dynamic based on content) ---
-    transcript = audio_data.get('transcript', '')
-    word_count = audio_data.get('word_count', 0)
-    questions = audio_data.get('questions_count', 0)
-    repetition = audio_data.get('repetition_score', 1.0)
-    if word_count > 20:
-        if word_count < 50:
-            tips.append(f"{random.choice(suggestion_phrases)} **Structure:** Short speech ({word_count} words)—add a story or example to expand impact. E.g., 'Imagine if...' engages audiences more.")
-        if questions > 1:
-            tips.append(f"✅ **Engagement:** {questions} questions in your transcript—smart! This draws listeners in. Build on it with rhetorical questions.")
-        if repetition < 0.7:
-            tips.append(f"{random.choice(suggestion_phrases)} **Variety:** Some repetition detected (score: {repetition:.2f}). Vary words (e.g., synonym for 'important') to keep it fresh and persuasive.")
-
-    # --- EMOTIONAL ALIGNMENT (Enhanced with multi-modal depth) ---
-    if visual_data and audio_data and audio_data.get('text_sentiment') != 'N/A':
-        facial_emotion = visual_data.get('dominant_emotion', '').lower()
-        vocal_emotion = audio_data.get('dominant_vocal_emotion', '').lower()
-        text_sentiment = audio_data.get('text_sentiment', '').lower()
-        neutral_perc = visual_data['emotion_distribution'].get('neutral', 0)
-        vocal_conf = audio_data.get('vocal_confidence', 0)
-
-        mismatch_score = 0
-        if text_sentiment == 'positive' and (facial_emotion in ['sad', 'angry', 'fearful'] or vocal_emotion in ['sad', 'angry']):
-            mismatch_score = 1 if vocal_conf > 0.7 else 0.5  # Stronger if confident mismatch
-            tips.append(f"💡 **Emotional Alignment:** Positive words (e.g., from '{transcript[:50]}...') clash with {facial_emotion} face/{vocal_emotion} tone (mismatch level: {'high' if mismatch_score > 0.7 else 'medium'}). Align by mirroring: Smile for positives! Practice in front of a mirror.")
-            engagement_score -= mismatch_score * 2
-        elif text_sentiment == 'negative' and (facial_emotion in ['happy', 'surprised'] or vocal_emotion == 'happy'):
-            tips.append(f"💡 **Emotional Alignment:** Serious message but upbeat cues—soften for credibility. Nod solemnly for emphasis. {random.choice(motivational_phrases)}")
-            engagement_score -= 1
-        elif neutral_perc > 0.7:
-            tips.append(f"💡 **Expression:** High neutral ({neutral_perc:.0%})—calm is good, but add {random.choice(['smiles', 'nods', 'raised eyebrows'])} for warmth. Expressive faces connect 2x better!")
-        elif vocal_conf < 0.5:
-            tips.append(f"💡 **Vocal Energy:** Low confidence ({vocal_conf:.0%}) in {vocal_emotion} tone—project louder! Warm up with vocal exercises like humming scales.")
-        else:
-            tips.append(f"🌟 **Emotional Alignment:** Seamless match across face, voice, and words. {random.choice(positive_phrases)} Authentic delivery!")
-
-    # Final score adjustment and wrap-up
-    engagement_score = max(0, min(10, engagement_score))
-    if engagement_score < 5:
-        tips.append(f"{random.choice(motivational_phrases)} Focus on one tip today—progress compounds!")
-    elif engagement_score > 8:
-        tips.append(f"🎉 **Pro Tip:** You're advanced—try audience interaction next time!")
-
-    if not tips:
-        return "Analysis incomplete (e.g., no clear speech/faces). Upload a better-lit video with audio for dynamic insights!"
-
-    return "**Your Dynamic Feedback Report**\n\n" + "\n\n".join(tips)
-
-
-def create_emotion_plot(visual_data: Optional[Dict]) -> Optional[go.Figure]:
-    """Creates a beautiful, interactive Plotly bar chart for facial emotion distribution."""
-    if not visual_data or "emotion_distribution" not in visual_data:
-        return None
-
-    data = visual_data["emotion_distribution"]
-    emotions = [e.capitalize() for e in data.keys()]
-    percentages = [p * 100 for p in data.values()]
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#F7B7A3']  # Soft pastel palette
-
-    fig = go.Figure(data=[
-        go.Bar(
-            x=emotions,
-            y=percentages,
-            text=[f"{p:.1f}%" for p in percentages],
-            textposition='auto',
-            marker_color=[colors[i % len(colors)] for i in range(len(emotions))],
-            hovertemplate="<b>%{x}</b><br>Percentage: %{y:.1f}%<extra></extra>"
-        )
-    ])
-
-    fig.update_layout(
-        title={
-            'text': "📊 Facial Emotion Distribution Over Time",
-            'x': 0.5,
-            'font': {'size': 20, 'family': "Arial"}
-        },
-        xaxis_title="Emotion",
-        yaxis_title="Percentage (%)",
-        yaxis_range=[0, 100],
-        template="plotly_white",
-        height=400,
-        margin=dict(l=20, r=20, t=60, b=40),
-        hovermode="x unified"
-    )
-
-    return fig
-
-
-def create_summary_badges(visual_data: Optional[Dict], audio_data: Dict, engagement_score: float) -> str:
-    """Returns HTML-style badge summary for UI header, now with dynamic score."""
-    badges = []
-
-    # NEW: Engagement score badge (color-coded)
-    score_color = "#4CAF50" if engagement_score > 7 else "#FF9800" if engagement_score > 5 else "#F4436"
-    badges.append(f"<span style='background-color:{score_color}; color:white; padding:8px 16px; border-radius:20px; font-size:16px; font-weight:bold; display:inline-block; margin:4px;'>📊 Engagement: {engagement_score:.1f}/10</span>")
-
-    # Pace badge
-    if 'pace_wpm' in audio_data:
-        wpm = audio_data['pace_wpm']
-        pace_status = "🟢 Ideal" if 120 <= wpm <= 170 else "🟡 Moderate" if wpm < 140 or wpm > 160 else "🔴 Needs Work"
-        badges.append(f"<span style='background-color:#e0f7fa; padding:6px 12px; border-radius:15px; font-size:14px; display:inline-block; margin:2px;'>🗣️ Pace: {pace_status} ({wpm:.0f} WPM)</span>")
-
-    # Filler words badge
-    if 'filler_words' in audio_data:
-        fillers = audio_data['filler_words']
-        filler_status = "🟢 Low" if fillers < 3 else "🟡 Medium" if fillers < 6 else "🔴 High"
-        badges.append(f"<span style='background-color:#fff3e0; padding:6px 12px; border-radius:15px; font-size:14px; display:inline-block; margin:2px;'>🗣️ Fillers: {filler_status} ({fillers})</span>")
-
-    # Emotional alignment badge
-    if visual_data and 'dominant_emotion' in visual_data and 'text_sentiment' in audio_data:
-        facial = visual_data['dominant_emotion'].lower()
-        text = audio_data['text_sentiment'].lower()
-        align = "🟢 Strong" if (text == 'positive' and facial in ['happy', 'surprised']) or (text == 'negative' and facial in ['sad', 'angry']) else "🟡 Okay" if facial == 'neutral' else "🔴 Weak"
-        badges.append(f"<span style='background-color:#f0f0f0; padding:6px 12px; border-radius:15px; font-size:14px; display:inline-block; margin:2px;'>🎭 Alignment: {align}</span>")
-
-    return " ".join(badges) if badges else ""
-
-
-# --- 5. MAIN ORCHESTRATOR FUNCTION ---
-def the_ai_communication_coach(video_path: str) -> tuple:
-    """
-    Main function that orchestrates full analysis.
-    Returns: coaching_tips, emotion_plot, detailed_report, summary_badges
-    """
-    print(f"🚀 Starting full analysis for: {os.path.basename(video_path) if video_path else 'No file'}")
-
-    # Validate input
-    if not video_path or not os.path.exists(video_path):
-        return "❌ No video uploaded.", None, "❌ No video provided.", ""
-
-    # Run analyses
-    print("🔍 Running visual analysis...")
-    visual_data = analyze_visuals(video_path)
-
-    print("🎙️ Running audio/text analysis...")
-    audio_data = analyze_audio_and_text(video_path)
-
-    # NEW: Calculate engagement score here for badges
-    engagement_score = 5.0  # Default
-    if 'pace_wpm' in audio_data:
-        wpm = audio_data['pace_wpm']
-        engagement_score += max(0, min(5, 5 - abs(wpm - 145) / 10))
-    if 'filler_rate' in audio_data:
-        engagement_score += max(0, 5 - (audio_data['filler_rate'] * 100 * 5))
-    if visual_data:
-        neutral_perc = visual_data['emotion_distribution'].get('neutral', 0)
-        engagement_score += max(0, 5 - (neutral_perc * 5))
-    engagement_score = max(0, min(10, engagement_score))
-
-    # Generate outputs
-    print("🧠 Generating dynamic coaching tips...")
-    coaching_tips = generate_coaching_tips(visual_data, audio_data)
-
-    print("📊 Creating emotion plot...")
-    emotion_plot = create_emotion_plot(visual_data)
-
-    print("📝 Assembling dynamic detailed report...")
-    # Visual Report (NEW: Interpretive)
-    if visual_data:
-        neutral_perc = visual_data['emotion_distribution'].get('neutral', 0)
-        visual_report = "--- 🎭 Visual Emotion Report ---\n"
-        visual_report += f"🔹 Dominant Facial Emotion: {visual_data['dominant_emotion'].capitalize()}\n"
-        visual_report += f"🔹 Total Faces Detected: {visual_data['total_faces_detected']}\n"
-        visual_report += "🔹 Emotion Distribution:\n"
-        for emotion, perc in visual_data['emotion_distribution'].items():
-            visual_report += f"   - {emotion.capitalize()}: {perc:.1%}\n"
-        # NEW: Dynamic interpretation
-        if neutral_perc > 0.6:
-            visual_report += f"\n💡 **Insight:** High neutral expression ({neutral_perc:.0%}) indicates a composed style, but varying emotions could increase audience connection by emphasizing key points."
-        elif visual_data['dominant_emotion'] in ['happy', 'surprised']:
-            visual_report += f"\n🌟 **Insight:** Positive dominant emotion aligns well with engaging communication—keep this energy!"
+        
+        # Calculate percentages and averages
+        face_detected_percentage = (face_detected_frames / visual_analysis["frame_count"]) * 100 if visual_analysis["frame_count"] > 0 else 0
+        eye_contact_percentage = (center_face_frames / face_detected_frames) * 100 if face_detected_frames > 0 else 0
+        
+        # Calculate average face size (proxy for distance from camera)
+        avg_face_size = sum(face_sizes) / len(face_sizes) if face_sizes else 0
+        
+        # Calculate average emotion scores
+        for emotion in EMOTIONS:
+            if all_emotions[emotion]:
+                visual_analysis["emotions"][emotion] = sum(all_emotions[emotion]) / len(all_emotions[emotion])
+        
+        # Store visual analysis results
+        visual_analysis["face_detections"] = face_detected_percentage
+        visual_analysis["eye_contact"] = eye_contact_percentage
+        visual_analysis["avg_face_size"] = avg_face_size
+        visual_analysis["duration"] = duration
+        visual_analysis["emotion_frame_counts"] = emotion_frame_counts
+        
+        # Create emotion radar chart
+        radar_chart = create_emotion_radar_chart(visual_analysis["emotions"])
+        
+        # Create a composite image of sample frames if available
+        sample_image = None
+        if sample_frames:
+            # Create a composite image showing different sample frames
+            sample_imgs = []
+            for img_path, emotion in sample_frames:
+                img = cv2.imread(img_path)
+                sample_imgs.append(img)
+            
+            # If we have samples, create a horizontal stack
+            if sample_imgs:
+                # Resize images to same height
+                height = min(sample_imgs[0].shape[0], 200)
+                resized_imgs = []
+                for img, (_, emotion) in zip(sample_imgs, sample_frames):
+                    aspect = img.shape[1] / img.shape[0]
+                    width = int(height * aspect)
+                    resized = cv2.resize(img, (width, height))
+                    resized_imgs.append(resized)
+                
+                # Create a combined image
+                sample_image = np.hstack(resized_imgs)
+    
+    result_dict["visual_analysis"] = visual_analysis
+    
+    # === GENERATE REPORT ===
+    # Audio analysis suggestions
+    audio_suggestions = []
+    
+    # Suggestion for speech rate
+    if wpm < 120:
+        audio_suggestions.append("Your speaking pace is slow. Try to speak a bit faster to maintain audience engagement.")
+    elif wpm > 160:
+        audio_suggestions.append("Your speaking pace is quite fast. Consider slowing down to improve clarity.")
     else:
-        visual_report = "--- 🎭 Visual Emotion Report ---\n⚠️ No faces detected. Tip: Ensure good lighting and face visibility for accurate analysis."
-
-    # Audio/Text Report (NEW: Dynamic sections and interpretation)
-    audio_text_report = "--- 🎙️ Audio & Text Analysis ---\n"
-    if 'error' in audio_data:
-        audio_text_report += f"⚠️ {audio_data['error']}\n\n💡 **Quick Fix:** Check audio levels and re-upload."
+        audio_suggestions.append("Your speaking pace is good, within the ideal range of 120-160 words per minute.")
+    
+    # Suggestion for filler words
+    if filler_percentage > 5:
+        audio_suggestions.append(f"You used filler words frequently ({filler_percentage:.1f}% of words). Try to reduce the use of: {', '.join(set(filler_instances))}.")
+    elif filler_percentage > 0:
+        audio_suggestions.append(f"You used some filler words ({filler_percentage:.1f}% of words). Be mindful of: {', '.join(set(filler_instances))}.")
     else:
-        transcript = audio_data.get('transcript', 'No transcript.')
-        audio_text_report += f"🔹 Duration: {audio_data.get('duration', 0):.1f} seconds\n"
-        audio_text_report += f"🔹 Pace: {audio_data.get('pace_wpm', 0):.1f} WPM (Words: {audio_data.get('word_count', 0)})\n"
-        if 'filler_words' in audio_data and audio_data['filler_words'] > 0:
-            examples = audio_data.get('filler_examples', [])
-            ex_str = f" (e.g., '{', '.join(examples)}')" if examples else ""
-            audio_text_report += f"🔹 Filler Words: {audio_data.get('filler_words', 0)}{ex_str}\n"
-        audio_text_report += f"🔹 Text Sentiment: {audio_data.get('text_sentiment', 'N/A')} (Confidence: {audio_data.get('text_sentiment_score', 0):.1%})\n"
-        if audio_data.get('questions_count', 0) > 0:
-            audio_text_report += f"🔹 Engagement Elements: {audio_data.get('questions_count', 0)} questions detected—great for interaction!\n"
-        # NEW: Dynamic interpretation
-        wpm = audio_data.get('pace_wpm', 0)
-        if wpm > 170:
-            audio_text_report += f"\n💡 **Pace Insight:** Fast delivery ({wpm:.0f} WPM) suits excitement but may overwhelm—ideal for short bursts."
-        elif wpm < 120:
-            audio_text_report += f"\n💡 **Pace Insight:** Deliberate pace ({wpm:.0f} WPM) builds thoughtfulness, perfect for complex topics."
-        sentiment = audio_data.get('text_sentiment', '')
-        if sentiment == 'POSITIVE':
-            audio_text_report += f"\n🌟 **Sentiment Insight:** Uplifting tone in transcript—pairs well with energetic delivery!"
-        elif sentiment == 'NEGATIVE':
-            audio_text_report += f"\n💡 **Sentiment Insight:** Serious content—ensure steady voice to convey empathy without overwhelming."
+        audio_suggestions.append("Great job avoiding filler words!")
+    
+    # Visual analysis suggestions
+    visual_suggestions = []
+    
+    # Visibility
+    if visual_analysis["face_detections"] < 70:
+        visual_suggestions.append(f"You were visible in the frame only {visual_analysis['face_detections']:.0f}% of the time. Try to stay in the camera view.")
+    else:
+        visual_suggestions.append(f"Good camera presence! You were visible {visual_analysis['face_detections']:.0f}% of the time.")
+        
+    # Eye contact
+    if visual_analysis["eye_contact"] < 50:
+        visual_suggestions.append(f"You maintained eye contact approximately {visual_analysis['eye_contact']:.0f}% of the time. Try to look at the camera more consistently.")
+    elif visual_analysis["eye_contact"] >= 70:
+        visual_suggestions.append(f"Excellent eye contact maintained ({visual_analysis['eye_contact']:.0f}% of the time).")
+    else:
+        visual_suggestions.append(f"You maintained good eye contact ({visual_analysis['eye_contact']:.0f}% of the time). Continue to engage with your audience.")
+    
+    # Distance from camera
+    if visual_analysis["avg_face_size"] < 5:
+        visual_suggestions.append("You appear to be too far from the camera. Consider moving closer for better engagement.")
+    elif visual_analysis["avg_face_size"] > 25:
+        visual_suggestions.append("You appear to be very close to the camera. Consider moving back slightly for a more professional framing.")
+    
+    # Emotional expression
+    dominant_emotion = max(visual_analysis["emotions"].items(), key=lambda x: x[1])
+    if dominant_emotion[1] > 0.5:
+        if dominant_emotion[0] == "neutral":
+            visual_suggestions.append(f"Your expressions are predominantly neutral ({dominant_emotion[1]:.0%}). Consider incorporating more varied expressions to engage your audience.")
+        elif dominant_emotion[0] == "happy":
+            visual_suggestions.append(f"Your expressions are mostly positive ({dominant_emotion[1]:.0%}), which helps establish rapport with your audience.")
+        elif dominant_emotion[0] in ["sad", "angry"]:
+            visual_suggestions.append(f"Your expressions show significant {dominant_emotion[0]} emotion ({dominant_emotion[1]:.0%}). This may affect how your message is received.")
+    
+    # Evaluate emotional variety
+    num_significant_emotions = sum(1 for emotion, score in visual_analysis["emotions"].items() if score > 0.2)
+    if num_significant_emotions <= 1:
+        visual_suggestions.append("Your facial expressions lack variety. Try to be more expressive to keep your audience engaged.")
+    elif num_significant_emotions >= 3:
+        visual_suggestions.append("You display a good range of emotions, which makes your presentation dynamic and engaging.")
+    
+    # Determine sentiment category
+    if sentiment_label == "POSITIVE":
+        emoji = "😊"
+        color = "#28a745"
+    elif sentiment_label == "NEGATIVE":
+        emoji = "😞"
+        color = "#dc3545"
+    else:
+        emoji = "😐"
+        color = "#ffc107"
+    
+    # Calculate processing time
+    processing_time = time.time() - start_time
+    
+    # Format the output HTML
+    output = f"<div style='margin: 20px;'>"
+    
+    # 1. Summary section
+    output += f"<h1>Speech and Presentation Analysis</h1>"
+    output += f"<div style='background-color: #f0f8ff; padding: 15px; border-radius: 5px; color:black; margin-bottom: 20px;'>"
+    output += f"<h2>Executive Summary</h2>"
+    output += f"<p><b>Speech Sentiment:</b> {sentiment_label} {emoji} ({sentiment_score:.0%} confidence)</p>"
+    output += f"<p><b>Speaking Pace:</b> {wpm} words per minute</p>"
+    output += f"<p><b>Filler Words:</b> {filler_percentage:.1f}% of speech</p>"
+    output += f"<p><b>Camera Presence:</b> {visual_analysis['face_detections']:.0f}% of video</p>"
+    output += f"<p><b>Eye Contact:</b> {visual_analysis['eye_contact']:.0f}% of visible time</p>"
+    output += f"<p><b>Dominant Expression:</b> {dominant_emotion[0]} ({dominant_emotion[1]:.0%})</p>"
+    output += "</div>"
+    
+    # 2. Transcription
+    output += f"<h2>Transcription:</h2>"
+    output += f"<div style='background-color: #f8f9fa; padding: 15px; border-radius: 5px; color:black; margin-bottom: 20px;'>{transcription}</div>"
+    
+    # 3. Audio Analysis
+    output += f"<h2>Speech Analysis:</h2>"
+    output += f"<div style='margin-bottom: 20px;'>"
+    output += f"<div style='text-align: center; margin: 15px; padding: 10px; border-radius: 5px; background-color: {color}20;'>"
+    output += f"<h3 style='color: {color};'>{sentiment_label} {emoji}</h3>"
+    output += f"<p>Confidence: {sentiment_score:.0%}</p>"
+    output += "</div>"
+    
+    output += f"<ul>"
+    output += f"<li><b>Total Words:</b> {total_words}</li>"
+    output += f"<li><b>Speech Duration:</b> {duration_minutes:.2f} minutes</li>"
+    output += f"<li><b>Speaking Rate:</b> {wpm} words per minute</li>"
+    output += f"<li><b>Filler Words:</b> {filler_count} ({filler_percentage:.1f}% of total words)</li>"
+    if filler_count > 0:
+        output += f"<li><b>Common Fillers:</b> {', '.join([f'{word} ({filler_instances.count(word)})' for word in set(filler_instances)])}</li>"
+    output += f"</ul>"
+    output += "</div>"
+    
+    # 4. Visual Analysis with improved emotion display
+    output += f"<h2>Visual Analysis:</h2>"
+    output += f"<div style='margin-bottom: 20px;'>"
+    
+    # Add the radar chart
+    output += f"<div style='text-align: center; margin-bottom: 20px;'>"
+    output += f"<h3>Emotion Distribution:</h3>"
+    output += f"<img src='{radar_chart}' alt='Emotion Radar Chart' style='max-width: 100%; height: auto;'>"
+    output += "</div>"
+    
+    # Emotion percentages as bar chart
+    output += f"<h3>Emotional Expression Details:</h3>"
+    output += f"<div style='margin-bottom: 15px;'>"
+    for emotion, percentage in sorted(visual_analysis["emotions"].items(), key=lambda x: x[1], reverse=True):
+        # Map emotions to colors
+        if emotion == "happy":
+            bar_color = "#28a745"  # green
+        elif emotion == "sad":
+            bar_color = "#6c757d"  # gray
+        elif emotion == "angry":
+            bar_color = "#dc3545"  # red
+        elif emotion == "surprise":
+            bar_color = "#ffc107"  # yellow
+        else:
+            bar_color = "#17a2b8"  # teal (neutral)
+            
+        # Create bar chart
+        bar_width = int(percentage * 100)
+        output += f"<div style='margin-bottom: 8px;'>"
+        output += f"<div style='display: flex; align-items: center;'>"
+        output += f"<div style='width: 80px;'><b>{emotion.capitalize()}:</b></div>"
+        output += f"<div style='flex-grow: 1; background-color: #e9ecef; border-radius: 4px; height: 20px;'>"
+        output += f"<div style='background-color: {bar_color}; height: 20px; width: {bar_width}%; min-width: 10px; border-radius: 4px; text-align: center; color: white;'>"
+        output += f"{percentage:.0%}" if bar_width > 15 else ""
+        output += f"</div></div>"
+        output += f"<div style='margin-left: 10px; width: 50px;'>{percentage:.0%}</div>"
+        output += f"</div></div>"
+    output += f"</div>"
+    
+    # Other visual metrics
+    output += f"<h3>Visual Presence Metrics:</h3>"
+    output += f"<ul>"
+    output += f"<li><b>Face Visibility:</b> {visual_analysis['face_detections']:.0f}% of the video</li>"
+    output += f"<li><b>Eye Contact Estimation:</b> {visual_analysis['eye_contact']:.0f}% of visible time</li>"
+    output += f"<li><b>Distance from Camera:</b> {'Good' if 5 <= visual_analysis['avg_face_size'] <= 25 else 'Needs adjustment'}</li>"
+    output += f"<li><b>Emotional Variety:</b> {num_significant_emotions} distinct expressions</li>"
+    output += f"</ul>"
+    output += "</div>"
+    
+    # 5. Improvement Suggestions
+    output += f"<h2>Improvement Suggestions:</h2>"
+    output += f"<div style='background-color: #f5f5f5; padding: 15px; border-radius: 5px; color:black; margin-bottom: 20px;'>"
+    output += f"<h3>Speech Suggestions:</h3>"
+    output += f"<ul class='suggestions'>"
+    for suggestion in audio_suggestions:
+        output += f"<li>{suggestion}</li>"
+    output += f"</ul>"
+    
+    output += f"<h3>Visual Presentation Suggestions:</h3>"
+    output += f"<ul class='suggestions'>"
+    for suggestion in visual_suggestions:
+        output += f"<li>{suggestion}</li>"
+    output += f"</ul>"
+    output += "</div>"
+    
+    # 6. Style for better presentation
+    output += f"""
+    <style>
+        ul.suggestions li {{
+            margin-bottom: 8px;
+            line-height: 1.5;
+        }}
+        h2 {{
+            color: #2c3e50;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }}
+        h3 {{
+            color: #34495e;
+            margin-top: 20px;
+        }}
+    </style>
+    """
+    
+    output += f"<p><i>Analysis completed in {processing_time:.2f} seconds</i></p>"
+    output += "</div>"
+    
+    # Clean up the temporary audio file
+    if os.path.exists(audio_file):
+        os.remove(audio_file)
+    
+    return output, transcription, sample_image
 
-        audio_text_report += "\n🔹 Full Transcript:\n"
-        if len(transcript) > 500:
-            transcript = transcript[:500] + "... (truncated for brevity)"
-        audio_text_report += f'"{transcript}"'
-
-    detailed_report = f"{visual_report}\n\n{'─' * 60}\n\n{audio_text_report}\n\n📊 **Overall Engagement Score: {engagement_score:.1f}/10** (Based on pace, clarity, and alignment)."
-
-    # Summary badges (enhanced with score)
-    summary_badges = create_summary_badges(visual_data, audio_data, engagement_score)
-
-    print("✅ Full dynamic analysis complete!")
-    return coaching_tips, emotion_plot, detailed_report, summary_badges
-
-
-# --- 6. GRADIO INTERFACE ---
-print("🚀🚀🚀 Launching the AI Communication Coach! 🚀🚀🚀")
-
-with gr.Blocks(theme=gr.themes.Soft(), title="AI Communication Coach") as demo:
-    gr.Markdown(
-        """
-        # 🤖 AI-Powered Communication Coach 🤖
-        Upload a video of yourself speaking — whether for a presentation, interview, or pitch — and receive **instant, personalized feedback** on your:
-
-        ✅ Facial expressions
-        ✅ Vocal tone & emotion
-        ✅ Speech pace & filler words
-        ✅ Emotional alignment with your message
-
-        *Analysis may take 1–3 minutes depending on video length. Feedback is now fully dynamic—tailored to your unique style!*
-        """
-    )
-
-    # Summary badges display
-    summary_badges_output = gr.HTML(label="📈 Quick Summary", elem_classes="summary-badges")
-
-    with gr.Row():
-        video_input = gr.Video(
-            label="🎥 Upload Your Video",
-            format="mp4",
-            height=300,
-            width=500,
-            interactive=True
-        )
-
-    analyze_button = gr.Button("✨ Analyze My Communication", variant="primary", size="lg")
-
-    with gr.Tabs():
-        with gr.TabItem("⭐ Key Coaching Tips"):
-            # NEW: Use Markdown for better dynamic rendering
-            coaching_output = gr.Markdown(
-                label="🌟 Your Personalized Feedback",
-                elem_classes="coaching-box"
-            )
-
-        with gr.TabItem("📊 Emotion Visualization"):
-            plot_output = gr.Plot(
-                label="Facial Emotion Trends Over Time"
-            )
-
-        with gr.TabItem("📄 Full Detailed Report"):
-            detailed_report_output = gr.Textbox(
-                label="📋 Complete Analysis Breakdown",
-                lines=20,
-                interactive=False,
-                show_copy_button=True,
-                elem_classes="report-box"
-            )
-
-    # Add footer
-    gr.Markdown(
-        """
-        ---
-        *Powered by DeepFace, Whisper, and Wav2Vec2.
-        Your video is processed locally — never uploaded to the cloud.
-        © 2025 AI Communication Coach — Built for growth, not surveillance.*
-        """
-    )
-
-    # Connect button to function
-    analyze_button.click(
-        fn=the_ai_communication_coach,
-        inputs=video_input,
-        outputs=[coaching_output, plot_output, detailed_report_output, summary_badges_output],
-        concurrency_limit=1  # Prevent overload
-    )
-
-    # Add CSS for styling
-    gr.HTML(
-        """
-        <style>
-            .summary-badges {
-                margin: 15px 0;
-                padding: 10px;
-                border-radius: 15px;
-                background-color: #f8f9fa;
-                border-left: 4px solid #4ECDC4;
-                text-align: center;
-            }
-            .coaching-box, .report-box {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 16px;
-                line-height: 1.6;
-            }
-            .gr-button {
-                font-weight: 600;
-                letter-spacing: 0.5px;
-            }
-            .gr-markdown h1 {
-                text-align: center;
-                color: #2d3748;
-            }
-            .gr-video {
-                border-radius: 10px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            }
-            .coaching-box h2 { color: #4ECDC4; }  /* NEW: Style dynamic headers */
-            .coaching-box strong { color: #2d3748; }
-        </style>
-        """
-    )
-
-# Launch with enhanced settings
-demo.launch(
-    debug=True,
-    share=True,
-    server_port=7860,
-    server_name="0.0.0.0",
-    show_api=False
+# Create Gradio interface
+demo = gr.Interface(
+    fn=analyze_video,
+    inputs=[
+        gr.Video(label="Upload or Record Video")
+    ],
+    outputs=[
+        gr.HTML(label="Comprehensive Analysis"),
+        gr.Textbox(label="Transcription Text"),
+        gr.Image(label="Expression Samples", visible=True)
+    ],
+    title="Advanced Speech and Visual Presentation Analyzer",
+    description="""
+    Upload a video to receive a comprehensive analysis of your presentation skills. 
+    This tool analyzes:
+    • Speech transcription and sentiment
+    • Speaking pace and filler words
+    • Facial expressions and emotions
+    • Eye contact and camera presence
+    
+    Get actionable feedback to improve your communication skills!
+    """,
+    examples=[]
 )
+
+# Launch the app
+if __name__ == "__main__":
+    demo.launch()
