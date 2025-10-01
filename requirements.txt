@@ -1,11 +1,24 @@
-gradio
-deepface
-transformers
-torch
-moviepy
-librosa
-soundfile
-openai-whisper
-datasets
-plotly
-opencv-python
+# Core dependencies
+gradio>=3.0.0
+transformers>=4.25.0
+openai-whisper>=20230124
+numpy>=1.20.0
+librosa>=0.9.0
+
+# Visualization
+matplotlib>=3.5.0
+
+# Video and image processing
+opencv-python>=4.5.0
+
+# Speech processing
+torch>=1.10.0
+torchaudio>=0.10.0
+ffmpeg-python>=0.2.0
+
+# Audio processing
+pydub>=0.25.1
+soundfile>=0.10.0
+
+# Ensure proper protobuf version to avoid conflicts
+protobuf>=3.20.0,<4.0.0
